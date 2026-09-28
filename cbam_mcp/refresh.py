@@ -1,0 +1,628 @@
+"""Rebuild the bundled snapshots from the sources, with the standard library only.
+
+    cbam-mcp refresh                     # all sources, into cbam_mcp/data/
+    cbam-mcp refresh --check-oj          # also compare every value with the Official Journal text
+    cbam-mcp refresh --data-dir DIR      # somewhere else (then set CBAM_MCP_DATA_DIR=DIR)
+
+Each source is fetched, parsed and checked on its own. A source that cannot be
+fetched or parsed leaves its previous file untouched; files are replaced
+atomically, so a failed refresh never leaves half a file behind.
+Exit codes: 0 all refreshed; 1 the Official Journal check found a difference;
+2 a source could not be refreshed.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import http.client
+import json
+import os
+import re
+import socket
+import ssl
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from . import __version__, legal, parsers
+
+UA = f"cbam-mcp/{__version__} (+https://github.com/Keremozdemirra/cbam-mcp)"
+SPARQL_ENDPOINT = "https://publications.europa.eu/webapi/rdf/sparql"
+CELLAR = legal.CELLAR
+# The consolidated text in use on 2026-09-24; used when the SPARQL lookup for a
+# newer one fails.
+PINNED_CONSOLIDATION = "02023R0956-20251020"
+# The consolidated text of the default-value act that includes Implementing Regulation
+# (EU) 2026/1740 (►M1), in use on 2026-09-24; the fallback when SPARQL cannot be asked.
+PINNED_VALUES_CONSOLIDATION = "02025R2621-20260101"
+EXCEL_URL = "https://taxation-customs.ec.europa.eu/document/download/1c05d211-80cb-4aaa-8ef0-e08005a95d7e_en"
+EXCEL_PAGE = "https://taxation-customs.ec.europa.eu/carbon-border-adjustment-mechanism/cbam-legislation-and-guidance_en"
+OJ_VALUES_CELEX = "32026R1740"
+CN_PREFIXES = ("25", "28", "31", "72", "73", "76", "2601", "2716")
+CN_YEARS = (2026, 2025)
+
+# Size limits chosen by this tool, well above the real files (2026-09-24:
+# consolidated XHTML 0.5 MB, Excel 0.6 MB, SPARQL answers 0.9 MB, OJ XHTML 16 MB).
+MAX_XHTML = 8 * 1024 * 1024
+MAX_XLSX = 16 * 1024 * 1024
+MAX_SPARQL = 16 * 1024 * 1024
+MAX_OJ = 64 * 1024 * 1024
+
+# Floor chosen by this tool: the 2025 and 2026 answers have about 1,600 concepts,
+# so far fewer means a truncated answer, which must not replace a good snapshot.
+MIN_CN_CONCEPTS = 500
+
+FILES = {"annex": "annex_i.json", "values": "default_values.json", "cn2026": "cn_2026.json", "cn2025": "cn_2025.json"}
+
+
+def mask_url(text) -> str:
+    """URL passwords and query strings masked: a proxy or a pasted link can carry either."""
+    s = re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1***@", str(text))
+    return re.sub(r"\?\S*", "?***", s)
+
+
+class FetchError(RuntimeError):
+    """A download that did not produce a usable body. The message is masked whole, before anything shortens it."""
+
+    def __init__(self, message):
+        super().__init__(mask_url(message))
+
+
+class Fetched:
+    def __init__(self, body: bytes, headers: dict, url: str):
+        self.body, self.headers, self.url = body, headers, url
+
+
+def fetch(url: str, *, accept: str = "*/*", data: bytes | None = None, timeout: float = 60,
+          max_bytes: int = MAX_XHTML, attempts: int = 2, sleep=time.sleep) -> Fetched:
+    """GET (or POST when `data` is given) with the failures that really happen turned into FetchError."""
+    headers = {"User-Agent": UA, "Accept": accept, "Accept-Language": "eng"}
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    last = "no attempt made"
+    for attempt in range(attempts):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", 200)
+                body = resp.read(max_bytes + 1)
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            if len(body) > max_bytes:
+                raise FetchError(f"{url}: response larger than {max_bytes // (1024 * 1024)} MB, refused")
+            # EUR-Lex answers 202 with an empty body to clients it does not serve.
+            if status != 200:
+                raise FetchError(f"{url}: HTTP {status} instead of 200")
+            if not body.strip():
+                raise FetchError(f"{url}: empty response body")
+            return Fetched(body, resp_headers, url)
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}"
+            if e.code == 429 or e.code >= 500:
+                retry_after = (e.headers or {}).get("Retry-After", "") if e.headers else ""
+                wait = int(retry_after) if retry_after.isdigit() and int(retry_after) <= 30 else 3
+                if attempt + 1 < attempts:
+                    sleep(wait)
+                    continue
+                if e.code == 429:
+                    last = "HTTP 429 (rate limited)"
+            raise FetchError(f"{url}: {last}") from None
+        except FetchError:
+            raise
+        except urllib.error.URLError as e:
+            last = f"network error ({e.reason})"
+        except (socket.timeout, TimeoutError):
+            last = f"timed out after {timeout:.0f} s"
+        except (http.client.HTTPException, ConnectionError, ssl.SSLError, OSError) as e:
+            last = f"connection failed ({type(e).__name__}: {e})"
+        if attempt + 1 < attempts:
+            sleep(3)
+    raise FetchError(f"{url}: {last}")
+
+
+def sparql(query: str, fetcher=fetch, what: str = "SPARQL") -> tuple[list[dict], Fetched]:
+    body = urllib.parse.urlencode({"query": query}).encode()
+    got = fetcher(SPARQL_ENDPOINT, accept="application/sparql-results+json", data=body, max_bytes=MAX_SPARQL)
+    return parsers.sparql_rows(got.body, what), got
+
+
+# ------------------------------------------------------------------ queries
+
+def q_consolidated(base: str) -> str:
+    return f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?celex ?date WHERE {{
+  ?base cdm:resource_legal_id_celex "{base}"^^xsd:string .
+  ?cons cdm:act_consolidated_consolidates_resource_legal ?base ;
+        cdm:resource_legal_id_celex ?celex .
+  OPTIONAL {{ ?cons cdm:act_consolidated_date ?date }}
+}} ORDER BY DESC(?celex) LIMIT 5"""
+
+Q_LATER_ACTS = """PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?base ?celex ?date ?rel (GROUP_CONCAT(DISTINCT STRAFTER(STR(?lang), "language/"); separator=",") AS ?langs) WHERE {
+  VALUES ?base { "32023R0956"^^xsd:string "32025R2621"^^xsd:string }
+  ?b cdm:resource_legal_id_celex ?base .
+  { ?act cdm:resource_legal_amends_resource_legal ?b . BIND("amends" AS ?rel) }
+  UNION { ?act cdm:resource_legal_corrects_resource_legal ?b . BIND("corrects" AS ?rel) }
+  ?act cdm:resource_legal_id_celex ?celex .
+  OPTIONAL { ?act cdm:work_date_document ?date }
+  OPTIONAL { ?e cdm:expression_belongs_to_work ?act ; cdm:expression_uses_language ?lang }
+} GROUP BY ?base ?celex ?date ?rel ORDER BY DESC(?date)"""
+
+# What the data in this package rests on: an act on these bases dated after
+# these dates is news the snapshot does not reflect yet.
+LEGAL_BASIS_DATES = {"32023R0956": ("02023R0956-20251020", "2025-10-20"), "32025R2621": ("32026R1740", "2026-07-20")}
+
+
+def q_cn(year: int) -> str:
+    cond = " || ".join(f'STRSTARTS(?id, "{p}")' for p in CN_PREFIXES)
+    return f"""PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xkos: <http://rdf-vocabulary.ddialliance.org/xkos#>
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+SELECT ?id ?notation ?label ?note ?parent ?depth WHERE {{
+  ?c skos:inScheme <http://data.europa.eu/xsp/cn{year}/cn{year}> ;
+     dc:identifier ?id .
+  FILTER({cond})
+  OPTIONAL {{ ?c skos:notation ?notation }}
+  OPTIONAL {{ ?c skos:altLabel ?label FILTER(lang(?label) = "en") }}
+  OPTIONAL {{ ?c skos:scopeNote ?note FILTER(lang(?note) = "en") }}
+  OPTIONAL {{ ?c skos:broader ?b . ?b dc:identifier ?parent }}
+  OPTIONAL {{ ?c xkos:depth ?depth }}
+}}"""
+
+
+def q_cn_ids(year: int, ids) -> str:
+    values = " ".join(f'"{i}"' for i in sorted(ids) if i.isdigit())
+    return f"""PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xkos: <http://rdf-vocabulary.ddialliance.org/xkos#>
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+SELECT ?id ?notation ?label ?note ?parent ?depth WHERE {{
+  VALUES ?id {{ {values} }}
+  ?c skos:inScheme <http://data.europa.eu/xsp/cn{year}/cn{year}> ;
+     dc:identifier ?id .
+  OPTIONAL {{ ?c skos:notation ?notation }}
+  OPTIONAL {{ ?c skos:altLabel ?label FILTER(lang(?label) = "en") }}
+  OPTIONAL {{ ?c skos:scopeNote ?note FILTER(lang(?note) = "en") }}
+  OPTIONAL {{ ?c skos:broader ?b . ?b dc:identifier ?parent }}
+  OPTIONAL {{ ?c xkos:depth ?depth }}
+}}"""
+
+
+# ------------------------------------------------------------------ writing
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        # mkstemp creates 0600; data files are meant to be readable like any other.
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def dump_json(doc: dict, big_keys: tuple = ()) -> str:
+    """JSON with one table row per line, so a refresh shows up as a readable diff."""
+    parts = []
+    for key, value in doc.items():
+        if key in big_keys and isinstance(value, dict):
+            inner = []
+            for k, v in value.items():
+                if isinstance(v, dict):
+                    rows = ",\n".join(f"  {json.dumps(rk, ensure_ascii=False)}: {json.dumps(rv, ensure_ascii=False)}"
+                                      for rk, rv in v.items())
+                    inner.append(f" {json.dumps(k, ensure_ascii=False)}: {{\n{rows}\n }}")
+                else:
+                    inner.append(f" {json.dumps(k, ensure_ascii=False)}: {json.dumps(v, ensure_ascii=False)}")
+            parts.append(f"{json.dumps(key)}: {{\n" + ",\n".join(inner) + "\n}")
+        elif key in big_keys and isinstance(value, list):
+            rows = ",\n".join(" " + json.dumps(v, ensure_ascii=False) for v in value)
+            parts.append(f"{json.dumps(key)}: [\n{rows}\n]")
+        else:
+            parts.append(f"{json.dumps(key)}: {json.dumps(value, ensure_ascii=False, indent=1)}")
+    return "{\n" + ",\n".join(parts) + "\n}\n"
+
+
+def load_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------ steps
+
+def later_acts(fetcher=fetch) -> dict:
+    rows, _ = sparql(Q_LATER_ACTS, fetcher, "later-acts query")
+    out: dict = {"32023R0956": [], "32025R2621": []}
+    for r in rows:
+        base = r.get("base")
+        if base in out and r.get("celex"):
+            langs = [x for x in (r.get("langs") or "").split(",") if x]
+            out[base].append({"celex": r["celex"], "date": r.get("date"), "relation": r.get("rel"),
+                              "english_version": "ENG" in langs, "languages": len(langs)})
+    return out
+
+
+def page_links(fetcher=fetch) -> list[str]:
+    """Default-value downloads listed on the Commission's CBAM page (informational)."""
+    got = fetcher(EXCEL_PAGE, accept="text/html", max_bytes=MAX_XHTML)
+    try:
+        text = got.body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise parsers.ParseError("Commission page is not UTF-8") from None
+    links = []
+    for href in re.findall(r'href="([^"]*/document/download/[^"]+)"', text):
+        name = urllib.parse.unquote(href.split("filename=", 1)[-1]) if "filename=" in href else ""
+        if name.lower().endswith(".xlsx") and ("dv" in name.lower() or "default" in name.lower()):
+            links.append(urllib.parse.urljoin(EXCEL_PAGE, href.replace("&amp;", "&")))
+    return links
+
+
+def latest_consolidation(base: str, pinned: str, fetcher, notes: list) -> tuple[str, str]:
+    """CELEX and date of the newest consolidated text of an act, or the pinned one if CELLAR cannot say."""
+    celex, date = pinned, f"{pinned[-8:-4]}-{pinned[-4:-2]}-{pinned[-2:]}"
+    try:
+        rows, _ = sparql(q_consolidated(base), fetcher, f"consolidated versions of {base}")
+        prefix = "0" + base[1:] + "-"
+        found = sorted((r for r in rows if (r.get("celex") or "").startswith(prefix)),
+                       key=lambda r: r.get("date") or "", reverse=True)
+        if found:
+            celex, date = found[0]["celex"], found[0].get("date") or date
+        else:
+            notes.append(f"SPARQL listed no consolidated version of {base}; used the pinned {pinned}")
+    except (FetchError, parsers.ParseError) as e:
+        notes.append(f"latest consolidated version of {base} not checked ({e}); used the pinned {pinned}")
+    return celex, date
+
+
+def refresh_annex(today: str, fetcher=fetch) -> dict:
+    notes: list = []
+    celex, cons_date = latest_consolidation("32023R0956", PINNED_CONSOLIDATION, fetcher, notes)
+    url = CELLAR + celex
+    got = fetcher(url, accept="application/xhtml+xml", max_bytes=MAX_XHTML)
+    parsed = parsers.parse_regulation_xhtml(got.body)
+    meta = {
+        "source": "Consolidated text of Regulation (EU) 2023/956 (CBAM Regulation)",
+        "celex": celex, "consolidation_date": cons_date, "reference": parsed["reference"], "url": url,
+        "retrieved": today, "sha256": sha256(got.body), "bytes": len(got.body),
+        "amendments": parsed["amendments"], "disclaimer": parsed["disclaimer"],
+        "annex_i_lines": len(parsed["annex_i"]), "annex_ii_lines": len(parsed["annex_ii"]), "notes": notes,
+    }
+    doc = {"meta": meta, "annex_i_intro": parsed["annex_i_intro"], "annex_i": parsed["annex_i"],
+           "annex_ii": parsed["annex_ii"], "annex_iii_point_1": parsed["annex_iii_point_1"], "quotes": parsed["quotes"]}
+    return doc
+
+
+# The rules this tool quotes, checked in each text: the amending act carries them and its
+# recital; the consolidated text carries the annex wording but no recitals.
+OJ_QUOTES = ("RULE_NOT_LISTED", "RULE_NO_VALUE", "NO_ROUTE", "HS_GROUP_ROUTE", "DIRECT_INDIRECT_FOR_INFORMATION")
+CONSOLIDATED_QUOTES = ("RULE_NOT_LISTED", "RULE_NO_VALUE", "NO_ROUTE", "HS_GROUP_ROUTE")
+
+
+def _norm_quotes(text: str) -> str:
+    # The amending act quotes table names with “ ”, the consolidated text with ‘ ’.
+    return re.sub("[\u2018\u2019\u201c\u201d\"']", "'", text)
+
+
+def markup_sentences(paragraphs: list) -> dict:
+    """The mark-up rule of Annex I and the Annex IV sentence that applies it, verbatim."""
+    out = {"annex_i": [], "annex_iv": []}
+    for i, t in enumerate(paragraphs):
+        if t.startswith("For the calculation of the number of CBAM certificates") and not out["annex_i"]:
+            out["annex_i"] = [t] + [x for x in paragraphs[i + 1:i + 4] if "the mark-up shall be" in x]
+        elif "shall be increased by the mark-ups laid down" in t and not out["annex_iv"]:
+            out["annex_iv"] = [t]
+    return out
+
+
+def compare_with_oj(values: dict, oj: dict, quote_names=OJ_QUOTES) -> dict:
+    tables, rows_cmp, rows_same, diffs = 0, 0, 0, []
+    for name, rows in values["tables"].items():
+        other = oj["tables"].get(name.replace("’", "'"))
+        if other is None:
+            diffs.append({"table": name, "problem": "table not found in the Official Journal text"})
+            continue
+        tables += 1
+        for code in sorted(set(rows) | set(other)):
+            rows_cmp += 1
+            if rows.get(code) == other.get(code):
+                rows_same += 1
+            elif len(diffs) < 50:
+                diffs.append({"table": name, "line": code, "excel": rows.get(code), "official_journal": other.get(code)})
+    a4 = values["annex_iv"]
+    a4_codes = sorted(set(a4) | set(oj["annex_iv"]))
+    a4_same = sum(1 for c in a4_codes if a4.get(c) == oj["annex_iv"].get(c))
+    for c in a4_codes:
+        if a4.get(c) != oj["annex_iv"].get(c) and len(diffs) < 50:
+            diffs.append({"table": "Annex IV", "line": c, "excel": a4.get(c), "official_journal": oj["annex_iv"].get(c)})
+    missing_tables = sorted(set(oj["tables"]) - {n.replace("’", "'") for n in values["tables"]})
+    text = _norm_quotes(oj["text"])
+    quotes = {name: _norm_quotes(getattr(legal, name)["quote"]) in text for name in quote_names}
+    return {"tables_compared": tables, "rows_compared": rows_cmp, "rows_identical": rows_same,
+            "annex_iv_compared": len(a4_codes), "annex_iv_identical": a4_same,
+            "tables_only_in_official_journal": missing_tables, "differences": diffs, "quotes_found": quotes}
+
+
+def refresh_values(data_dir: Path, today: str, fetcher=fetch, check_oj: bool = False, excel_url: str = EXCEL_URL,
+                   log=print) -> tuple[dict, bool]:
+    got = fetcher(excel_url, accept="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+                  max_bytes=MAX_XLSX)
+    parsed = parsers.parse_default_values_xlsx(got.body)
+    digest = sha256(got.body)
+    disposition = got.headers.get("content-disposition", "")
+    filename = None
+    if "filename=" in disposition:
+        filename = disposition.split("filename=", 1)[1].strip().strip('"')
+    latest = max(parsed["versions"], key=lambda v: int(v["version"])) if parsed["versions"] else {}
+    tables = {name: {code: "|".join(row) for code, row in rows.items()} for name, rows in parsed["tables"].items()}
+    annex_iv = {code: "|".join(row) for code, row in parsed["annex_iv"].items()}
+    meta = {
+        "source": "European Commission, DG TAXUD: Default values definitive period (Excel format)",
+        "url": mask_url(excel_url), "page": EXCEL_PAGE, "filename": filename, "retrieved": today, "sha256": digest,
+        "bytes": len(got.body), "version": latest.get("version"), "version_date": latest.get("date"),
+        "version_note": latest.get("note"), "versions": parsed["versions"], "disclaimer": parsed["disclaimer"],
+        "sheets": parsed["sheet_count"], "tables": len(tables), "rows": sum(len(t) for t in tables.values()),
+        "lines": len(parsed["order"]), "annex_iv_rows": len(annex_iv), "oj_check": None,
+    }
+    try:
+        listed = page_links(fetcher)
+        uuid = excel_url.rsplit("/", 1)[-1].split("?")[0].replace("_en", "")
+        meta["page_check"] = {"checked": today, "downloads_listed": listed,
+                              "this_file_listed": any(uuid in link for link in listed)}
+        if not meta["page_check"]["this_file_listed"]:
+            log(f"note: the Commission page lists other default-value downloads: {listed}")
+    except (FetchError, parsers.ParseError) as e:
+        meta["page_check"] = {"checked": today, "error": str(e)}
+    # The consolidated default-value act: where the mark-up rule is quoted from, and a
+    # line-by-line check of the Excel against it, on every refresh.
+    notes: list = []
+    cons_celex, cons_date = latest_consolidation("32025R2621", PINNED_VALUES_CONSOLIDATION, fetcher, notes)
+    cons_got = fetcher(CELLAR + cons_celex, accept="application/xhtml+xml", max_bytes=MAX_OJ, timeout=180)
+    cons = parsers.parse_oj_default_values(cons_got.body)
+    markup = markup_sentences(cons["paragraphs"])
+    if len(markup["annex_i"]) < 2:
+        raise parsers.ParseError(f"{cons_celex}: no mark-up rule found in the introductory part of Annex I; "
+                                 "the layout or the law changed")
+    cons_check = compare_with_oj(parsed, cons, CONSOLIDATED_QUOTES)
+    meta["consolidated"] = {
+        "celex": cons_celex, "consolidation_date": cons_date, "reference": cons["reference"],
+        "url": CELLAR + cons_celex, "retrieved": today, "sha256": sha256(cons_got.body), "bytes": len(cons_got.body),
+        "amendments": cons["amendments"], "disclaimer": cons["disclaimer"], "markup": markup, "notes": notes,
+        "check": cons_check}
+    found_difference = bool(cons_check["differences"]) or not all(cons_check["quotes_found"].values())
+    if check_oj:
+        oj_got = fetcher(CELLAR + OJ_VALUES_CELEX, accept="application/xhtml+xml", max_bytes=MAX_OJ, timeout=180)
+        oj = parsers.parse_oj_default_values(oj_got.body)
+        result = compare_with_oj(parsed, oj)
+        result.pop("paragraphs", None)
+        result.update({"checked": today, "celex": OJ_VALUES_CELEX, "url": CELLAR + OJ_VALUES_CELEX,
+                       "sha256": sha256(oj_got.body), "bytes": len(oj_got.body)})
+        meta["oj_check"] = result
+        found_difference = found_difference or bool(result["differences"]) or not all(result["quotes_found"].values())
+    else:
+        previous = load_json(data_dir / FILES["values"])
+        prev_meta = (previous or {}).get("meta") or {}
+        # A check made on a byte-identical file still holds; on any other file it does not.
+        if prev_meta.get("sha256") == digest and prev_meta.get("oj_check"):
+            meta["oj_check"] = prev_meta["oj_check"]
+    lines = [[c, parsed["lines"][c]["display"], parsed["lines"][c]["description"], parsed["lines"][c]["category"]]
+             for c in parsed["order"]]
+    doc = {"meta": meta, "other_table": parsed["other_table"], "lines": lines, "tables": tables, "annex_iv": annex_iv}
+    return doc, found_difference
+
+
+def refresh_cn(year: int, today: str, fetcher=fetch) -> dict:
+    rows, got = sparql(q_cn(year), fetcher, f"CN {year} query")
+    concepts = parsers.parse_cn_rows(rows)
+    hashes = [sha256(got.body)]
+    # Chapters 26 and 27 and their section are only needed as ancestors of 2601 and 2716.
+    for _ in range(3):
+        missing = {c[4] for c in concepts.values() if c[4] and c[4] not in concepts}
+        if not missing:
+            break
+        more, got = sparql(q_cn_ids(year, missing), fetcher, f"CN {year} ancestors query")
+        hashes.append(sha256(got.body))
+        concepts.update(parsers.parse_cn_rows(more))
+    if len(concepts) < MIN_CN_CONCEPTS:
+        raise parsers.ParseError(f"CN {year}: only {len(concepts)} concepts returned; refusing to replace the snapshot")
+    meta = {
+        "source": f"Combined Nomenclature {year}, EU Vocabularies (Publications Office of the European Union)",
+        "year": year, "scheme": f"http://data.europa.eu/xsp/cn{year}/cn{year}", "endpoint": SPARQL_ENDPOINT,
+        "dataset": legal.CN_DATASET[year], "legal_basis": legal.CN_BINDING_SOURCE[year],
+        "subset": "Chapters 25, 28, 31, 72, 73 and 76 in full; headings 2601 and 2716 with their chapters",
+        "retrieved": today, "sha256_of_responses": hashes, "concepts": len(concepts),
+    }
+    return {"meta": meta, "concepts": dict(sorted(concepts.items()))}
+
+
+# ------------------------------------------------------------------ SOURCES.md
+
+def _licence(key: str) -> list:
+    lic = legal.LICENCES[key]
+    out = [f"- Licence: {lic['name']}. Terms: {lic['terms']} (read {lic['read']}): \"{lic['quote']}\""]
+    if lic.get("quote_2"):
+        out.append(f"  and: \"{lic['quote_2']}\"")
+    return out
+
+
+def render_sources(annex: dict | None, values: dict | None, cn: dict, acts: dict | None, today: str) -> str:
+    out = ["# Sources of the bundled data", "",
+           "Generated by `cbam-mcp refresh`; edit the code, not this file. Dates are retrieval dates (UTC).", ""]
+    if annex:
+        m = annex["meta"]
+        out += ["## annex_i.json: CBAM scope (Annexes I, II and III of Regulation (EU) 2023/956)", "",
+                f"- Source: {m['source']}, CELEX {m['celex']} ({m.get('reference') or ''})",
+                f"- URL: {m['url']} (CELLAR, content negotiation `Accept: application/xhtml+xml`, `Accept-Language: eng`)",
+                f"- Retrieved: {m['retrieved']}; {m['bytes']} bytes; SHA-256 `{m['sha256']}`",
+                f"- Rows: {m['annex_i_lines']} Annex I lines, {m['annex_ii_lines']} Annex II lines, "
+                f"{len((annex.get('annex_iii_point_1') or {}).get('countries', []))} Annex III countries, "
+                f"{len((annex.get('annex_iii_point_1') or {}).get('territories', []))} Annex III territories",
+                f"- Amended by: {', '.join(f'{k} = {v}' for k, v in m.get('amendments', {}).items()) or 'none'}",
+                f"- Legal status: the consolidated text says: \"{m.get('disclaimer') or ''}\"",
+                *_licence("eurlex_consolidated"),
+                "- Attribution: © European Union, https://eur-lex.europa.eu. Changes: table extracted from the "
+                "XHTML (codes, descriptions, gases, exceptions); amendment markers kept as `amended_by`.", ""]
+        for n in m.get("notes") or []:
+            out.append(f"- Note: {n}")
+    if values:
+        m = values["meta"]
+        out += ["## default_values.json: default values (Commission Excel)", "",
+                f"- Source: {m['source']}",
+                f"- URL: {m['url']} (file name `{m.get('filename')}`), listed on {m['page']}",
+                f"- Retrieved: {m['retrieved']}; {m['bytes']} bytes; SHA-256 `{m['sha256']}`",
+                f"- Version: {m.get('version')} of {m.get('version_date')} (sheet 'Version History': "
+                f"\"{m.get('version_note')}\")",
+                f"- Rows: {m['sheets']} sheets; {m['tables']} tables (countries plus 'Other countries and "
+                f"territories'); {m['rows']} country lines over {m['lines']} CN/TARIC lines; "
+                f"{m['annex_iv_rows']} Annex IV lines",
+                f"- Legal status: \"{legal.EXCEL_NOTICE['quote']}\" ({legal.EXCEL_NOTICE['source']}). The file "
+                f"itself says: \"{m.get('disclaimer')}\"",
+                *_licence("commission_excel"),
+                "- Attribution: Source: European Commission, DG TAXUD. Changes: values kept as published "
+                "(decimal comma); answers convert them to numbers (derived).", ""]
+        cons = m.get("consolidated")
+        if cons:
+            c = cons["check"]
+            out += [f"- Consolidated text of Implementing Regulation (EU) 2025/2621: CELEX {cons['celex']} "
+                    f"({cons.get('reference')}), {cons['url']}; retrieved {cons['retrieved']}; {cons['bytes']} bytes; "
+                    f"SHA-256 `{cons['sha256']}`; amended by "
+                    f"{', '.join(f'{k} = {v}' for k, v in (cons.get('amendments') or {}).items()) or 'none'}.",
+                    f"  - Mark-up rule quoted from it (Annex I, introductory part): "
+                    + " ".join(f"\"{x}\"" for x in cons["markup"]["annex_i"])
+                    + (f" Annex IV: \"{cons['markup']['annex_iv'][0]}\"" if cons["markup"].get("annex_iv") else ""),
+                    f"  - Compared with the Excel at this refresh: {c['rows_identical']} of {c['rows_compared']} "
+                    f"country lines in {c['tables_compared']} tables and {c['annex_iv_identical']} of "
+                    f"{c['annex_iv_compared']} Annex IV lines identical; quoted rules found: "
+                    f"{', '.join(k for k, v in c['quotes_found'].items() if v) or 'none'}.",
+                    *(f"  - Note: {n}" for n in cons.get("notes") or []),
+                    *_licence("eurlex_consolidated"), ""]
+        check = m.get("oj_check")
+        if check:
+            out += [f"- Checked against the Official Journal on {check['checked']} (licence of that text: "
+                    f"{legal.LICENCES['eurlex_oj']['name']}; \"{legal.LICENCES['eurlex_oj']['quote']}\"): {check['url']} "
+                    f"(SHA-256 `{check['sha256']}`): {check['rows_identical']} of {check['rows_compared']} country "
+                    f"lines in {check['tables_compared']} tables and {check['annex_iv_identical']} of "
+                    f"{check['annex_iv_compared']} Annex IV lines identical; quoted rules found: "
+                    f"{', '.join(k for k, v in check['quotes_found'].items() if v) or 'none'}.", ""]
+        else:
+            out += ["- Not checked against the Official Journal text for this file (run `cbam-mcp refresh --check-oj`).", ""]
+    for year in sorted(cn, reverse=True):
+        m = cn[year]["meta"]
+        out += [f"## cn_{year}.json: Combined Nomenclature {year} (subset)", "",
+                f"- Source: {m['source']}; dataset {m['dataset']}; scheme {m['scheme']}",
+                f"- Endpoint: {m['endpoint']} (SPARQL; the queries are in `cbam_mcp/refresh.py`)",
+                f"- Retrieved: {m['retrieved']}; {m['concepts']} concepts ({m['subset']}); SHA-256 of the "
+                f"responses: {', '.join(f'`{h}`' for h in m['sha256_of_responses'])}",
+                "- The endpoint's answers are not byte-stable (row order varies between calls); the file sorts "
+                "concepts by identifier, so a refresh of unchanged data changes only these hashes.",
+                f"- Legally binding text: {m['legal_basis']}",
+                *_licence("cn"),
+                "- Attribution: Source: Publications Office of the European Union, EU Vocabularies. Changes: English "
+                "labels only; leading dashes turned into an indent number.", ""]
+    if acts and isinstance(acts.get("acts"), dict):
+        out += [f"## Later acts (CELLAR SPARQL, checked {acts.get('checked')})", ""]
+        for base, rows in acts["acts"].items():
+            listed = "; ".join(f"{r['celex']} {r.get('relation')} {r.get('date')}"
+                               + ("" if r.get("english_version", True) else " (no English version in CELLAR)")
+                               for r in rows) or "none"
+            out.append(f"- Acts amending or correcting {base}: {listed}")
+            ref, date = LEGAL_BASIS_DATES.get(base, (None, None))
+            if ref:
+                later = [r["celex"] for r in rows if (r.get("date") or "") > date and r["celex"] != ref]
+                out.append(f"  - Dated after {ref} ({date}): {', '.join(later) if later else 'none'}")
+        out.append("")
+    if values and (values["meta"].get("page_check") or {}).get("downloads_listed") is not None:
+        pc = values["meta"]["page_check"]
+        out += [f"- Commission page {EXCEL_PAGE} ({pc['checked']}) lists these default-value downloads: "
+                f"{', '.join(pc['downloads_listed']) or 'none'}; the bundled file is "
+                f"{'among them' if pc['this_file_listed'] else 'NOT among them'}.", ""]
+    out += ["## Not bundled", "",
+            "- Annexes II and III to Implementing Regulation (EU) 2025/2621 (emission factors for indirect "
+            "emissions and default values for electricity). The Excel does not contain them, and the regulation "
+            f"says: \"{legal.IEA_NOTICE['quote']}\".", ""]
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------------ driver
+
+def run(data_dir: Path, *, only=None, check_oj: bool = False, excel_url: str = EXCEL_URL, fetcher=fetch,
+        today: str | None = None, log=print) -> int:
+    today = today or dt.datetime.now(dt.timezone.utc).date().isoformat()
+    data_dir = Path(data_dir)
+    wanted = set(only or ("annex", "values", "cn"))
+    failures: list[str] = []
+    found_difference = False
+
+    def step(name, fn):
+        try:
+            return fn()
+        except (FetchError, parsers.ParseError, KeyError, ValueError, TypeError, RecursionError) as e:
+            failures.append(f"{name}: {e}")
+            log(f"FAILED {name}: {e}; previous file kept")
+            return None
+
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        probe = data_dir / ".write-test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        log(f"cannot write to {data_dir}: {e}. Use --data-dir and set CBAM_MCP_DATA_DIR to it.")
+        return 2
+
+    if "annex" in wanted:
+        doc = step("annex", lambda: refresh_annex(today, fetcher))
+        if doc:
+            write_atomic(data_dir / FILES["annex"], dump_json(doc, ("annex_i", "annex_ii")))
+            log(f"annex_i.json: {doc['meta']['celex']}, {doc['meta']['annex_i_lines']} Annex I lines")
+    if "values" in wanted:
+        res = step("values", lambda: refresh_values(data_dir, today, fetcher, check_oj, excel_url, log))
+        if res:
+            doc, found_difference = res
+            write_atomic(data_dir / FILES["values"], dump_json(doc, ("lines", "tables", "annex_iv")))
+            m = doc["meta"]
+            log(f"default_values.json: version {m['version']} of {m['version_date']}, {m['rows']} lines in {m['tables']} tables")
+            if m.get("oj_check"):
+                c = m["oj_check"]
+                log(f"Official Journal check: {c['rows_identical']}/{c['rows_compared']} lines and "
+                    f"{c['annex_iv_identical']}/{c['annex_iv_compared']} Annex IV lines identical")
+    if "cn" in wanted:
+        for year in CN_YEARS:
+            doc = step(f"cn{year}", lambda y=year: refresh_cn(y, today, fetcher))
+            if doc:
+                write_atomic(data_dir / FILES[f"cn{year}"], dump_json(doc, ("concepts",)))
+                log(f"cn_{year}.json: {doc['meta']['concepts']} concepts")
+    # Informational: a failure here is reported but does not fail the refresh,
+    # and the previous answer (with its own date) stays.
+    acts_doc = load_json(data_dir / "later_acts.json")
+    try:
+        acts_doc = {"checked": today, "acts": later_acts(fetcher)}
+        write_atomic(data_dir / "later_acts.json", json.dumps(acts_doc, indent=1) + "\n")
+    except (FetchError, parsers.ParseError) as e:
+        log(f"later-acts check not done ({e}); previous result kept")
+
+    annex = load_json(data_dir / FILES["annex"])
+    values = load_json(data_dir / FILES["values"])
+    cn = {}
+    for year in CN_YEARS:
+        doc = load_json(data_dir / FILES[f"cn{year}"])
+        if doc:
+            cn[year] = doc
+    write_atomic(data_dir / "SOURCES.md", render_sources(annex, values, cn, acts_doc, today))
+    if failures:
+        return 2
+    return 1 if found_difference else 0
