@@ -112,27 +112,32 @@ $ cbam-mcp describe 7308 20 10
 Standard library only, Python 3.9 or newer, no dependencies. The data ships inside the package, so
 answering needs no network.
 
-As an MCP server in Claude Code:
+Nothing is published to PyPI; every install runs straight from GitHub. As an MCP server in Claude Code:
 
 ```
-claude mcp add cbam-mcp -- uvx cbam-mcp
+claude mcp add cbam-mcp -- uvx --from git+https://github.com/Keremozdemirra/cbam-mcp cbam-mcp
 ```
 
-In any other MCP client, the server is the command `uvx cbam-mcp` (or `pipx run cbam-mcp`) over stdio:
+In any other MCP client, the server is the same `uvx` command over stdio:
 
 ```json
-{"mcpServers": {"cbam-mcp": {"command": "uvx", "args": ["cbam-mcp"]}}}
+{"mcpServers": {"cbam-mcp": {"command": "uvx", "args": ["--from", "git+https://github.com/Keremozdemirra/cbam-mcp", "cbam-mcp"]}}}
 ```
 
 On the command line:
 
 ```
-uvx cbam-mcp scope 7208 51 20
-pipx run cbam-mcp value 7601 10 00 India
+uvx --from git+https://github.com/Keremozdemirra/cbam-mcp cbam-mcp scope 7208 51 20
+pipx install git+https://github.com/Keremozdemirra/cbam-mcp && cbam-mcp value 7601 10 00 India
 ```
 
-The PyPI package is published by this repository's release workflow; until the first release, install
-from a checkout with `pip install .`, or run `python3 -m cbam_mcp` in it.
+or `pip install git+https://github.com/Keremozdemirra/cbam-mcp`. From a checkout:
+
+```
+git clone https://github.com/Keremozdemirra/cbam-mcp && cd cbam-mcp && pip install .
+```
+
+or run `python3 -m cbam_mcp` in it without installing.
 
 ## Tools and commands
 

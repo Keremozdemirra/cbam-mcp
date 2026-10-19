@@ -93,8 +93,7 @@ class Packaging(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f'version = "{__version__}"', pyproject)
         self.assertEqual(server["version"], __version__)
-        self.assertEqual(server["packages"][0]["version"], __version__)
-        self.assertEqual(server["packages"][0]["identifier"], "cbam-mcp")
+        self.assertNotIn("packages", server)  # not on PyPI; installed from GitHub
         self.assertIn(f"<!-- mcp-name: {server['name']} -->", readme)
         self.assertLess(len(server["description"]), 100)
 
