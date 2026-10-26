@@ -56,7 +56,7 @@ $ cbam-mcp compare 7601 10 00 India Türkiye
   Source: European Commission, DG TAXUD, default values Excel version 2, re-used under Commission Decision 2011/833/EU, retrieved 2026-09-24; decimal commas converted to numbers (derived)
 ```
 
-The warning is a finding, not noise: CN 2025 and CN 2026 split 7601 10 into 7601 10 10 (slabs) and
+The warning is a finding: CN 2025 and CN 2026 split 7601 10 into 7601 10 10 (slabs) and
 7601 10 90; the default-value table gives one line for all of heading 7601.
 
 An "ex" line of Annex I is never reported as fully in scope:
@@ -154,7 +154,7 @@ CN codes are read as `7208 51 20`, `72085120`, `7208.51.20`, with or without `ex
 (TARIC) digits. Countries are read as the table names (`Türkiye`), other names from the EU country
 authority table (`Turkey`, `Republic of Korea`, `UK`, `Czech Republic`), a few abbreviations of this
 tool's own (`PRC`, `S. Korea`, `UAE`, `DRC`) or ISO 3166-1 alpha-2 codes (`TR`). A name that is none of
-these is an error, never a fallback: for a third country the tables do not list, ask for country
+these is an error: for a third country the tables do not list, ask for country
 `Other countries and territories` explicitly. `--json` prints the structure the MCP tool returns.
 Exit codes: 0 answered, 2 the question or the data could not be read.
 
@@ -257,7 +257,7 @@ MIT for the code. The bundled data keeps the licence bases listed above.
 - **Not the legally binding values.** The Excel is published "for information purposes only"; the
   binding values are Annex I and IV to Implementing Regulation (EU) 2025/2621 as corrected by
   Implementing Regulation (EU) 2026/1740, as published in the Official Journal. The listed values are
-  shown before the mark-up; the rule is quoted, not applied. Default values for electricity and
+  shown before the mark-up; the rule is quoted without being applied. Default values for electricity and
   emission factors for indirect emissions (Annexes II and III) are not included.
 - **No duty rates.** Duty rates live in TARIC, for which the Commission's TARIC page
   (https://taxation-customs.ec.europa.eu/online-services/online-services-and-databases-customs/eu-customs-tariff-taric_en)
